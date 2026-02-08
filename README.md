@@ -22,6 +22,9 @@ This fork:
 - Improved SQLite query method to speed up all operations by `200 times` including: library access, search, chapter list (`x300 times`)
 - Details manga
 - Aidoku source new SDK (0.7) support
+- **Cover mode** — switch between list and cover view in the library and search results, with async cover loading and local caching
+- **Previous chapter navigation** — swipe backward on the first page to seamlessly jump to the previous chapter
+- **Configurable items per page** — set how many items to show per page in both list and cover modes
 
 <table>
   <tr>
@@ -36,6 +39,21 @@ This fork:
 </tr>
 </table>
 <em>Open source for Every One</em>
+
+### Library Display Modes
+
+Switch between **List** and **Cover** mode from the library view menu:
+
+<table>
+  <tr>
+    <th>List Mode</th>
+    <th>Cover Mode</th>
+  </tr>
+  <tr>
+    <td><img src="docs/src/images/library-list-mode.png" width="300" alt="Library in list mode" /></td>
+    <td><img src="docs/src/images/library-cover-mode.png" width="300" alt="Library in cover mode with manga covers, tags, and source info" /></td>
+  </tr>
+</table>
 
 <p align="center">
     <img src="docs/src/images/demo.gif" width="60%" />
