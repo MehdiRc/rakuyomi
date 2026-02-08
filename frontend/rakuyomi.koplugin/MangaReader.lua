@@ -12,17 +12,21 @@ local Testing = require('testing')
 local MangaReader = {
   on_return_callback = nil,
   on_end_of_book_callback = nil,
+  on_beginning_of_book_callback = nil,
   chapter = nil,
   on_close_book_callback = nil,
   is_showing = false,
+  goto_last_page = false,
 }
 
 --- @class MangaReaderOptions
 --- @field path string Path to the file to be displayed.
 --- @field on_return_callback fun(): nil Function to be called when the user selects "Go back to Rakuyomi".
 --- @field on_end_of_book_callback fun(): nil Function to be called when the user reaches the end of the file.
+--- @field on_beginning_of_book_callback? fun(): nil Function to be called when the user tries to go back past the first page.
 --- @field chapter? Chapter The chapter being read.
 --- @field on_close_book_callback? fun(Chapter): nil Function to be called when the user closes the manga reader.
+--- @field goto_last_page? boolean If true, the reader will navigate to the last page after opening.
 
 --- Displays the file located in `path` in the KOReader's reader.
 --- If a file is already being displayed, it will be replaced.
@@ -31,8 +35,10 @@ local MangaReader = {
 function MangaReader:show(options)
   self.on_return_callback = options.on_return_callback
   self.on_end_of_book_callback = options.on_end_of_book_callback
+  self.on_beginning_of_book_callback = options.on_beginning_of_book_callback
   self.chapter = options.chapter
   self.on_close_book_callback = options.on_close_book_callback
+  self.goto_last_page = options.goto_last_page or false
 
   if self.is_showing and ReaderUI.instance ~= nil then
     -- if we're showing, just switch the document
@@ -74,11 +80,42 @@ function MangaReader:hookWithPriorityOntoReaderUiEvents(ui)
     -- return true in the first invocation...
     return self:onEndOfBook()
   end
+  eventListener.onReaderReady = function()
+    -- If goto_last_page was requested, navigate to the last page after the reader is ready.
+    if self.goto_last_page and self.is_showing then
+      self.goto_last_page = false
+      local Event = require("ui/event")
+      ui:handleEvent(Event:new("GotoPercent", 100))
+    end
+  end
   eventListener.onCloseWidget = function()
     self:onReaderUiCloseWidget()
   end
 
   table.insert(ui, 2, eventListener)
+
+  -- Wrap ReaderPaging:onGotoViewRel to intercept backward navigation on page 1.
+  -- We must wrap the method directly because touch/swipe page turns call it
+  -- directly on the ReaderPaging instance, bypassing the event system.
+  if ui.paging then
+    local orig_onGotoViewRel = ui.paging.onGotoViewRel
+    ui.paging.onGotoViewRel = function(paging_self, diff, ...)
+      if diff == -1 and self.is_showing and self.on_beginning_of_book_callback then
+        if paging_self.current_page == 1 then
+          logger.info("Got beginning of book — navigating to previous chapter")
+          -- Defer the callback to the next event loop tick so it runs
+          -- outside the touch/gesture handler context, avoiding re-entrancy
+          -- issues with UIManager and ReaderUI.
+          local cb = self.on_beginning_of_book_callback
+          UIManager:nextTick(function()
+            cb()
+          end)
+          return true
+        end
+      end
+      return orig_onGotoViewRel(paging_self, diff, ...)
+    end
+  end
 end
 
 --- Used to add the "Go back to Rakuyomi" menu item. Is called from `ReaderUI`, via the

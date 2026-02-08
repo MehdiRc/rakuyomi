@@ -1,8 +1,10 @@
 -- FIXME make class names have _some_ kind of logic
+local Blitbuffer = require("ffi/blitbuffer")
 local ConfirmBox = require("ui/widget/confirmbox")
 local InputDialog = require("ui/widget/inputdialog")
 local UIManager = require("ui/uimanager")
 local Screen = require("device").screen
+local Size = require("ui/size")
 local Trapper = require("ui/trapper")
 local _ = require("gettext+")
 local Icons = require("Icons")
@@ -39,6 +41,7 @@ local RadioButtonWidget = require("ui/widget/radiobuttonwidget")
 local LoadingDialog = require("LoadingDialog")
 local MangaInfoWidget = require("MangaInfoWidget")
 local CheckboxDialog = require("CheckboxDialog")
+local logger = require("logger")
 
 local DGENERIC_ICON_SIZE = G_defaults:readSetting("DGENERIC_ICON_SIZE")
 local SMALL_FONT_FACE = Font:getFace("smallffont")
@@ -55,12 +58,24 @@ local LibraryView = Menu:extend {
 
 function LibraryView:init()
   self.mangas = self.mangas or {}
+  self.manga_details = self.manga_details or {}
+  self.display_mode = self.display_mode or "list"
   self.title_bar_left_icon = "appbar.menu"
   self.onLeftButtonTap = function()
     self:openMenu()
   end
   self.width = Screen:getWidth()
   self.height = Screen:getHeight()
+
+  -- Apply user-configured items per page
+  if self.display_mode == "cover" then
+    self.items_per_page = G_reader_settings:readSetting("rakuyomi_items_per_page_cover") or 4
+  else
+    local list_per_page = G_reader_settings:readSetting("rakuyomi_items_per_page_list")
+    if list_per_page then
+      self.items_per_page = list_per_page
+    end
+  end
 
   local page = self.page
   Menu.init(self)
@@ -71,8 +86,13 @@ function LibraryView:init()
 
   self:patchTitleBar(0)
   self:fetchCountNotification()
-
   self:updateItems()
+end
+
+function LibraryView:onClose()
+  -- Cancel any in-flight async cover fetches
+  self._async_cover_gen = (self._async_cover_gen or 0) + 1
+  UIManager:close(self)
 end
 
 --- @private
@@ -127,59 +147,94 @@ function LibraryView:patchTitleBar(count_notify)
           local response = Backend.getSettings()
           if response.type == 'ERROR' then
             ErrorDialog:show(response.message)
+            return
           end
 
           local settings = response.body
+          local show_sort_dialog
 
-          local key = "library_sorting_mode"
-          local tuple = findEntries(Settings.setting_value_definitions, key)
+          local submenu
 
-          local radio_buttons = {}
-          for _, option in ipairs(tuple.options) do
-            table.insert(radio_buttons, {
-              {
-                text = option.label,
-                provider = option.value,
-                checked = settings[key] == option.value,
-              },
-            })
+          show_sort_dialog = function()
+            UIManager:close(submenu)
+            local key = "library_sorting_mode"
+            local tuple = findEntries(Settings.setting_value_definitions, key)
+            local radio_buttons = {}
+            for _, option in ipairs(tuple.options) do
+              table.insert(radio_buttons, {
+                {
+                  text = option.label,
+                  provider = option.value,
+                  checked = settings[key] == option.value,
+                },
+              })
+            end
+            local dialog = RadioButtonWidget:new {
+              title_text = tuple.title,
+              radio_buttons = radio_buttons,
+              callback = function(radio)
+                UIManager:close(dialog)
+                settings[key] = radio.provider
+                local r = Backend.setSettings(settings)
+                if r.type == 'ERROR' then
+                  ErrorDialog:show(r.message)
+                  return
+                end
+                local r2 = Backend.getMangasInLibrary()
+                if r2.type == 'ERROR' then
+                  ErrorDialog:show(r2.message)
+                  return
+                end
+                self.mangas_raw = r2.body
+                self.favorite_search_keyword = nil
+                self.mangas = r2.body
+                self:updateItems()
+              end
+            }
+            UIManager:show(dialog)
           end
 
-          local dialog
-          dialog = RadioButtonWidget:new {
-            title_text = tuple.title,
-            radio_buttons = radio_buttons,
-            callback = function(radio)
-              UIManager:close(dialog)
+          -- Resolve current display mode (prefer local setting over backend)
+          local display_mode_key = "library_display_mode"
+          local current_display_mode = G_reader_settings:readSetting("rakuyomi_library_display_mode")
+              or settings[display_mode_key] or "list"
+          settings[display_mode_key] = current_display_mode
 
-              settings[key] = radio.provider
-
-              local response = Backend.setSettings(settings)
-              if response.type == 'ERROR' then
-                ErrorDialog:show(response.message)
-                return
-              end
-
-              local response = Backend.getMangasInLibrary()
-              if response.type == 'ERROR' then
-                ErrorDialog:show(response.message)
-
-                return
-              end
-
-              local mangas = response.body
-
-              self.mangas_raw = mangas
-              self.favorite_search_keyword = nil
-              self.mangas = mangas
-
-              self:updateItems()
-
-              UIManager:show(dialog)
+          local function set_display_mode(value)
+            if current_display_mode == value then
+              UIManager:close(submenu)
+              return
             end
-          }
+            UIManager:close(submenu)
+            settings[display_mode_key] = value
+            G_reader_settings:saveSetting("rakuyomi_library_display_mode", value)
+            local r = Backend.setSettings(settings)
+            if r.type == 'ERROR' then
+              ErrorDialog:show(r.message)
+              return
+            end
+            self:fetchAndShow()
+          end
 
-          UIManager:show(dialog)
+          submenu = ButtonDialog:new {
+            title = _("Library view"),
+            buttons = {
+              { { text = _("Library sorting mode"), callback = show_sort_dialog } },
+              {
+                {
+                  text = _("List"),
+                  checked = current_display_mode == "list",
+                  callback = function() set_display_mode("list") end,
+                },
+                {
+                  text = _("Cover"),
+                  checked = current_display_mode == "cover",
+                  callback = function() set_display_mode("cover") end,
+                },
+              },
+            },
+          }
+          UIManager:show(submenu)
         end)
       end
     },
@@ -189,29 +244,25 @@ function LibraryView:patchTitleBar(count_notify)
     HorizontalSpan:new {
       width = Screen:getWidth() - button_padding - right_icon_size - button_padding * 2 - right_icon_size - button_padding * 2 - right_icon_size - button_padding, -- extend button tap zone
     },
-    VerticalGroup:new {
-      Button:new {
-        text = Icons.FA_BELL .. count_notify,
-        face = SMALL_FONT_FACE,
-        bordersize = 0,
-        enabled = true,
-        text_font_size = 16,
-        text_font_bold = false,
-        callback = function()
-          Trapper:wrap(function()
-            local onReturnCallback = function()
-              self:fetchAndShow()
-            end
+    Button:new {
+      text = Icons.FA_BELL .. count_notify,
+      face = SMALL_FONT_FACE,
+      bordersize = 0,
+      enabled = true,
+      text_font_size = 16,
+      text_font_bold = false,
+      padding = button_padding,
+      callback = function()
+        Trapper:wrap(function()
+          local onReturnCallback = function()
+            self:fetchAndShow()
+          end
 
-            NotificationView:fetchAndShow(onReturnCallback)
+          NotificationView:fetchAndShow(onReturnCallback)
 
-            self:onClose()
-          end)
-        end
-      },
-      VerticalSpan:new {
-        width = right_icon_size / 2
-      }
+          self:onClose()
+        end)
+      end
     },
     IconButton:new {
       icon = "appbar.search",
@@ -246,25 +297,38 @@ function LibraryView:patchTitleBar(count_notify)
 end
 
 --- @private
-function LibraryView:updateItems()
+function LibraryView:updateItems(select_number, no_recalculate_dimen)
   if #self.mangas > 0 then
     self.item_table = self:generateItemTableFromMangas(self.mangas)
     self.multilines_show_more_text = false
-    self.items_per_page = nil
+    -- Restore user-configured items per page
+    if self.display_mode == "cover" then
+      self.items_per_page = G_reader_settings:readSetting("rakuyomi_items_per_page_cover") or 4
+    else
+      self.items_per_page = G_reader_settings:readSetting("rakuyomi_items_per_page_list")
+    end
   else
     self.item_table = self:generateEmptyViewItemTable()
     self.multilines_show_more_text = true
     self.items_per_page = 1
   end
 
-  Menu.updateItems(self)
+  -- Cover mode uses same list flow; Menu.updateItems builds rows with cover on left + tags (LibraryCoverMenuItem).
+  Menu.updateItems(self, select_number, no_recalculate_dimen)
+
+  -- Kick off async cover loading for the current page (e.g. after a page change)
+  if self.display_mode == "cover" and #self.mangas > 0 then
+    self:_asyncLoadCovers()
+  end
 end
 
 --- @private
 --- @param mangas Manga[]
 function LibraryView:generateItemTableFromMangas(mangas)
   local item_table = {}
-  for _, manga in ipairs(mangas) do
+  local source_name = function(m) return (m.source and m.source.name) or "" end
+  local source_id = function(m) return (m.source and m.source.id) or "" end
+  for i, manga in ipairs(mangas) do
     local mandatory = (manga.last_read and calcLastReadText(manga.last_read) .. " " or "")
 
     if manga.unread_chapters_count ~= nil and manga.unread_chapters_count > 0 then
@@ -272,12 +336,40 @@ function LibraryView:generateItemTableFromMangas(mangas)
           .. Icons.FA_BELL .. manga.unread_chapters_count
     end
 
-    table.insert(item_table, {
+    local item = {
       manga = manga,
-      text = manga.title,
-      post_text = manga.source.name,
+      text = manga.title or "",
+      post_text = source_name(manga),
       mandatory = mandatory,
-    })
+    }
+    -- Cover mode: add cover_file and tags_text from manga details (same source as detail page)
+    if self.display_mode == "cover" then
+      local ok_cover, err_cover = pcall(function()
+        local tags_display = ""
+        if self.manga_details then
+          local key = source_id(manga) .. "/" .. (manga.id or "")
+          local details = self.manga_details[key]
+          if details then
+            item.cover_file = details.cover_file
+            if details.tags and #details.tags > 0 then
+              tags_display = table.concat(details.tags, ", ")
+            end
+          end
+        end
+        item.cover_file = item.cover_file or nil
+        item.tags_text = tags_display
+        -- Keep post_text SHORT (just source name) so the standard MenuItem doesn't crash
+        -- when BaseMenu.updateItems renders it. LibraryCoverMenuItem reads tags from tags_text.
+        item.post_text = source_name(manga)
+      end)
+      if not ok_cover then
+        logger.err("generateItemTableFromMangas cover block row", i, ":", err_cover)
+        item.cover_file = nil
+        item.tags_text = ""
+        item.post_text = source_name(manga)
+      end
+    end
+    table.insert(item_table, item)
   end
 
   return item_table
@@ -306,14 +398,105 @@ function LibraryView:fetchAndShow()
   end
 
   local mangas = response.body
+  local display_mode = "list"
+  local manga_details = {}
 
-  UIManager:show(LibraryView:new {
+  -- Prefer locally stored display mode (backend may not persist it)
+  display_mode = G_reader_settings:readSetting("rakuyomi_library_display_mode")
+  if not display_mode then
+    local settings_response = Backend.getSettings()
+    if settings_response.type ~= 'ERROR' and settings_response.body then
+      display_mode = settings_response.body.library_display_mode
+    end
+  end
+  display_mode = display_mode or "list"
+
+  -- Close the current instance (if any) before showing the new one,
+  -- so old LibraryView widgets don't pile up in the UIManager stack.
+  UIManager:close(self)
+
+  local view = LibraryView:new {
     mangas = mangas,
+    display_mode = display_mode,
+    manga_details = manga_details,
     covers_fullscreen = true, -- hint for UIManager:_repaint()
     page = self.page
-  })
+  }
+  UIManager:show(view)
+
+  -- Cover mode: load covers asynchronously after the page is displayed.
+  -- Each cover is fetched one at a time via nextTick so the UI stays responsive.
+  if display_mode == "cover" and #mangas > 0 then
+    view:_asyncLoadCovers()
+  end
 
   Testing:emitEvent('library_view_shown')
+end
+
+--- Loads covers for the mangas on the current page.
+--- Phase 1: resolves already-cached covers synchronously (no placeholder flash).
+--- Phase 2: fetches remaining covers asynchronously one at a time via nextTick.
+--- @private
+function LibraryView:_asyncLoadCovers()
+  local coverCovers = require("utils/fetchMangaCovers")
+  local perpage = self.perpage or self.items_per_page or 14
+  local page = self.page or 1
+  local start_idx = (page - 1) * perpage + 1
+  local end_idx = math.min(start_idx + perpage - 1, #self.mangas)
+
+  self.manga_details = self.manga_details or {}
+
+  -- Phase 1: resolve already-cached covers instantly (no network, no nextTick)
+  local need_network = {}
+  local resolved_count = 0
+  for i = start_idx, end_idx do
+    local m = self.mangas[i]
+    if m then
+      local key = coverCovers.detailKey(m)
+      if not self.manga_details[key] then
+        local cached = coverCovers.fetchCachedCover(m)
+        if cached then
+          self.manga_details[key] = cached
+          resolved_count = resolved_count + 1
+        else
+          table.insert(need_network, m)
+        end
+      end
+    end
+  end
+
+  -- If we resolved any NEW cached covers, rebuild items so they show immediately
+  if resolved_count > 0 then
+    self:updateItems()
+  end
+
+  if #need_network == 0 then return end
+
+  -- Phase 2: fetch remaining covers asynchronously (these need network requests)
+  self._async_cover_gen = (self._async_cover_gen or 0) + 1
+  local gen = self._async_cover_gen
+  local view = self
+
+  local idx = 1
+  local function fetchNext()
+    if view._async_cover_gen ~= gen then return end
+    if idx > #need_network then
+      view:updateItems()
+      return
+    end
+
+    local manga = need_network[idx]
+    idx = idx + 1
+
+    local detail, _ = coverCovers.fetchOneMangaCover(manga)
+    if detail then
+      view.manga_details[coverCovers.detailKey(manga)] = detail
+    end
+
+    UIManager:nextTick(fetchNext)
+  end
+
+  UIManager:nextTick(fetchNext)
 end
 
 --- @private
@@ -357,7 +540,6 @@ function LibraryView:onContextMenuChoice(item)
           end
 
           self:fetchAndShow()
-          UIManager:close(self)
         end
       },
       {
@@ -536,6 +718,14 @@ function LibraryView:_handleRemoveFromLibrary(manga)
     text = _("Do you want to remove") .. "\" " .. manga.title .. "\" " .. _("from your library?"),
     ok_text = _("Remove"),
     ok_callback = function()
+      -- Grab cached cover URL before removing so we can clean up the local cache
+      local cover_src = nil
+      local details_resp = Backend.cachedMangaDetails(Backend.createCancelId(), manga.source.id, manga.id)
+      if details_resp.type ~= 'ERROR' and details_resp.body and details_resp.body[1] then
+        local mmanga = details_resp.body[1]
+        cover_src = mmanga.url or mmanga.cover_url
+      end
+
       local response = Backend.removeMangaFromLibrary(manga.source.id, manga.id)
 
       if response.type == 'ERROR' then
@@ -543,8 +733,16 @@ function LibraryView:_handleRemoveFromLibrary(manga)
 
         return
       end
+
+      -- Clean up cached cover image
+      if cover_src then
+        local ok, coverCache = pcall(require, "utils/coverCache")
+        if ok and coverCache then
+          pcall(coverCache.removeCover, cover_src)
+        end
+      end
+
       self:fetchAndShow()
-      self:onClose()
     end
   })
 end
@@ -654,7 +852,6 @@ function LibraryView:openMenu()
                     text = _("Local database has been migrated from the server!")
                   })
 
-                  UIManager:close(self)
                   UIManager:close(dialog)
                   self:fetchAndShow()
                 end)
@@ -679,7 +876,6 @@ function LibraryView:openMenu()
                           text = _("Cloud database has been forcedly replaced with local one!")
                         })
 
-                        UIManager:close(self)
                         UIManager:close(dialog)
                         self:fetchAndShow()
                       end)
@@ -943,7 +1139,6 @@ function LibraryView:refreshAllChapters()
       progressbar_dialog:redrawProgressbarIfNeeded()
     end
 
-    UIManager:close(self)
     self:fetchAndShow()
 
     progressbar_dialog:close()

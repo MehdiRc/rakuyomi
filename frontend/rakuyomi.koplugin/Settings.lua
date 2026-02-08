@@ -56,6 +56,17 @@ Settings.setting_value_definitions = {
     }
   },
   {
+    'library_display_mode',
+    {
+      type = 'enum',
+      title = _("Library display mode"),
+      options = {
+        { label = _("List"),   value = 'list' },
+        { label = _("Cover"),  value = 'cover' },
+      }
+    }
+  },
+  {
     'storage_path',
     {
       type = 'path',
@@ -176,6 +187,40 @@ function Settings:init()
   table.insert(vertical_group, SettingItem:new {
     show_parent = self,
     width = self.item_width,
+    label = _("Items per page (list mode)"),
+    value_definition = {
+      type = 'integer',
+      title = _("Items per page (list mode)"),
+      min_value = 4,
+      max_value = 30,
+      unit = 'items',
+    },
+    value = G_reader_settings:readSetting("rakuyomi_items_per_page_list") or 14,
+    on_value_changed_callback = function(new_value)
+      G_reader_settings:saveSetting("rakuyomi_items_per_page_list", new_value)
+    end
+  })
+
+  table.insert(vertical_group, SettingItem:new {
+    show_parent = self,
+    width = self.item_width,
+    label = _("Items per page (cover mode)"),
+    value_definition = {
+      type = 'integer',
+      title = _("Items per page (cover mode)"),
+      min_value = 2,
+      max_value = 10,
+      unit = 'items',
+    },
+    value = G_reader_settings:readSetting("rakuyomi_items_per_page_cover") or 4,
+    on_value_changed_callback = function(new_value)
+      G_reader_settings:saveSetting("rakuyomi_items_per_page_cover", new_value)
+    end
+  })
+
+  table.insert(vertical_group, SettingItem:new {
+    show_parent = self,
+    width = self.item_width,
     label = _("Allow requisition of the back button"),
     value_definition = {
       type = 'boolean',
@@ -247,6 +292,11 @@ end
 function Settings:updateSetting(key, value)
   self.settings[key] = value
 
+  -- Persist library_display_mode locally so it works even if backend doesn't store it
+  if key == "library_display_mode" then
+    G_reader_settings:saveSetting("rakuyomi_library_display_mode", value)
+  end
+
   local response = Backend.setSettings(self.settings)
   if response.type == 'ERROR' then
     ErrorDialog:show(response.message)
@@ -266,8 +316,12 @@ function Settings:fetchAndShow(on_return_callback)
     ErrorDialog:show(response.message)
   end
 
+  local settings = response.body or {}
+  -- Persist library_display_mode locally so it works even if backend doesn't store it
+  settings.library_display_mode = G_reader_settings:readSetting("rakuyomi_library_display_mode") or settings.library_display_mode or "list"
+
   local ui = Settings:new {
-    settings = response.body,
+    settings = settings,
     on_return_callback = on_return_callback
   }
   ui.on_return_callback = on_return_callback

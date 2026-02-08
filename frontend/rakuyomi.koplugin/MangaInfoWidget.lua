@@ -581,10 +581,11 @@ end
 
 --- @param raw_manga Manga
 --- @param on_return_callback fun()|nil
+--- @return boolean true if the widget was shown, false/nil on failure or cancellation
 function MangaInfoWidget:fetchAndShow(raw_manga, on_return_callback)
   local response = self:refreshDetails(raw_manga.source.id, raw_manga.id)
   if response == nil then
-    return
+    return false
   end
 
   ---@diagnostic disable-next-line: redundant-parameter
@@ -595,6 +596,7 @@ function MangaInfoWidget:fetchAndShow(raw_manga, on_return_callback)
     on_return_callback = on_return_callback,
   }
   UIManager:show(widget)
+  return true
 end
 
 return MangaInfoWidget

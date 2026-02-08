@@ -39,6 +39,7 @@ local findLastRead = require("utils/findLastRead")
 local getChapterDisplayName = require("utils/getChapterDisplayName")
 
 local findNextChapter = require("chapters/findNextChapter")
+local findPreviousChapter = require("chapters/findPreviousChapter")
 
 local DGENERIC_ICON_SIZE = G_defaults:readSetting("DGENERIC_ICON_SIZE")
 local Font = require("ui/font")
@@ -770,6 +771,21 @@ function ChapterListing:downloadChapter(chapter, download_job, callback)
           return response_start
         end
 
+        if chapter.downloaded then
+          -- The chapter is already downloaded, so the backend should complete
+          -- almost immediately. Poll with a short interval (100ms) instead of
+          -- the default 1-second interval to avoid unnecessary delay.
+          -- This is safe because this code runs inside a forked subprocess
+          -- (via Trapper:dismissableRunInSubprocess), not the main UI thread.
+          while true do
+            local result = download_job:poll()
+            if result.type ~= 'PENDING' then
+              return result
+            end
+            ffiutil.usleep(100000) -- 100ms
+          end
+        end
+
         return download_job:runUntilCompletion()
       end,
       function()
@@ -859,6 +875,7 @@ function ChapterListing:preloadChapters(chapter)
     chapter = preloadChapter
     ::continue::
   end
+
 end
 
 function ChapterListing:prunePreloadJobs()
@@ -883,7 +900,8 @@ end
 --- @private
 --- @param chapter Chapter
 --- @param download_job DownloadChapter|nil
-function ChapterListing:openChapterOnReader(chapter, download_job)
+--- @param goto_last_page? boolean If true, open the chapter on its last page.
+function ChapterListing:openChapterOnReader(chapter, download_job, goto_last_page)
   self:downloadChapter(chapter, download_job, function(manga_path)
     local onReturnCallback = function()
       self:updateItems()
@@ -911,6 +929,17 @@ function ChapterListing:openChapterOnReader(chapter, download_job)
       end
     end
 
+    local onBeginningOfBookCallback = function()
+      local prevChapter = findPreviousChapter(self.chapters, chapter)
+
+      if prevChapter ~= nil then
+        logger.info("opening previous chapter (last page)", prevChapter)
+        local prevChapterDownloadJob = self.preload_jobs[prevChapter.id] or nil
+        self:openChapterOnReader(prevChapter, prevChapterDownloadJob, true)
+      end
+      -- If no previous chapter exists, do nothing (stay on page 1)
+    end
+
     Trapper:wrap(function()
       Backend.updateLastReadChapter(
         chapter.source_id,
@@ -923,6 +952,8 @@ function ChapterListing:openChapterOnReader(chapter, download_job)
     MangaReader:show({
       path = manga_path,
       on_end_of_book_callback = onEndOfBookCallback,
+      on_beginning_of_book_callback = onBeginningOfBookCallback,
+      goto_last_page = goto_last_page,
       chapter = chapter,
       on_close_book_callback = function(chapter)
         Trapper:wrap(function()
